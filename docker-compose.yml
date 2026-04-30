@@ -1,0 +1,48 @@
+# Demonstration Docker Compose
+# Shows how wonderwall can be used to isolate a container (curl) from
+# accessing the open internet
+
+# Variables:
+# WONDERWALL_IP - Static address used by the wonderwall container so the
+#   "curl" container can name it as its DNS server.
+# INTERNAL_SUBNET - The subnet of the internal network; WONDERWALL_IP must be
+#   within it. When wonderwall knows the subnet, DNS queries for internal
+#   hostnames (e.g. postgres) resolve to their real IPs rather than to
+#   WONDERWALL_IP, keeping them reachable. Without this, all queries resolve
+#   to WONDERWALL_IP and internal services become unreachable.
+
+services:
+  wonderwall:
+    build: .
+    environment:
+      DNS_A_RECORD_IP: ${WONDERWALL_IP:-172.128.0.128}
+      INTERNAL_SUBNET: ${INTERNAL_SUBNET:-172.128.0.0/24}
+      ALLOWED_HOSTS: "*.google.com,google.com,*.httpbin.org,httpbin.org"
+    networks:
+      default: {}
+      internal:
+        ipv4_address: ${WONDERWALL_IP:-172.128.0.128}
+
+  # curl container for demonstrating HTTP/HTTPS/DNS interception behavior
+  curl:
+    image: curlimages/curl
+    command: sleep infinity
+    networks:
+      - internal
+    dns:
+      - ${WONDERWALL_IP:-172.128.0.128}
+
+  # postgres Container For Demonstrating INTERNAL_SUBNET behavior
+  postgres:
+    image: postgres
+    networks:
+      - internal
+    environment:
+      POSTGRES_PASSWORD: NEEDED_FOR_POSTGRES_TO_START
+
+networks:
+  internal:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${INTERNAL_SUBNET:-172.128.0.0/24}
