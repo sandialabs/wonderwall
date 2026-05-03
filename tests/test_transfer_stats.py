@@ -1,9 +1,7 @@
 """Comprehensive tests for TransferStats class."""
 
-import asyncio
-import logging
 import sys
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 import pytest
 
 # Add project to path for direct imports

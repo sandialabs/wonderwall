@@ -1,0 +1,47 @@
+{
+	"name": "Python 3.14 + Claude Code",
+	"build": {
+		"dockerfile": "Dockerfile",
+		"args": {
+			// Override these to match your host user's UID/GID to avoid permission
+			// issues with bind-mounted source files.
+			// Run `id -u` and `id -g` on your host to find the right values.
+			"USERNAME": "vscode",
+			"USER_UID": "1000",
+			"USER_GID": "1000"
+		}
+	},
+	// Run as the non-root vscode user inside the container
+	"remoteUser": "vscode",
+	// Mount the project source into /workspaces/<project>.
+	// Replace <project> with your actual project name in both fields below.
+	"workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/wonderwall,type=bind,consistency=cached",
+	"workspaceFolder": "/workspaces/wonderwall",
+	// Named volumes for persistence across container rebuilds
+	"mounts": [
+		// Persists ~/.claude (settings, projects, auth tokens)
+		"source=devcontainer-claude-config,target=/home/vscode/.claude,type=volume",
+		// Persists bash history
+		"source=devcontainer-bash-history,target=/home/vscode/.bash_history_dir,type=volume"
+	],
+	// Forward common dev ports – adjust as needed
+	"forwardPorts": [],
+	// VS Code extensions to install in the container
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ms-python.python",
+				"ms-python.vscode-pylance",
+				"charliermarsh.ruff",
+				"anthropic.claude-code"
+			],
+			"settings": {
+				"terminal.integrated.defaultProfile.linux": "bash"
+			}
+		}
+	},
+	// Fix ownership of named volumes after they are first mounted.
+	// Docker creates named volumes as root-owned; this hands them back to vscode.
+	// Runs once when the container is created (not on every start).
+	"postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.claude /home/vscode/.bash_history_dir && echo 'Dev container ready. Run: claude' && python --version"
+}
