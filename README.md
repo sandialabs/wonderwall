@@ -42,14 +42,25 @@ All configuration is via environment variables.
 
 ## Running with Docker
 
+Docker images of wonderwall are published to the GitHub Container Registry:
+
+```sh
+docker pull ghcr.io/sandialabs/wonderwall:0.2
+```
+
+Or build locally from source:
+
 ```sh
 docker build -t wonderwall .
+```
+
+```sh
 docker run \
   -e DNS_A_RECORD_IP=<your-container-ip> \
   -p 53:53/udp \
   -p 80:80 \
   -p 443:443 \
-  wonderwall
+  ghcr.io/sandialabs/wonderwall:0.2
 ```
 
 Static files can be mounted into the container:
