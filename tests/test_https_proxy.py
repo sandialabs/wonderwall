@@ -1,7 +1,6 @@
 """Tests for wonderwall TLS SNI proxy (wonderwall/proxy.py)."""
 
 import asyncio
-import re
 import socket
 from unittest.mock import AsyncMock, MagicMock, patch
 
