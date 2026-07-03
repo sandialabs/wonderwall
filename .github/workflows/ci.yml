@@ -33,8 +33,34 @@ jobs:
       - name: Lint
         run: poetry run ruff check .
 
+      - name: Build Squid sidecar image
+        run: docker build -t wonderwall-squid-ci .devcontainer/squid
+
+      - name: Start Squid sidecar
+        run: docker run -d --name squid -p 3128:3128 wonderwall-squid-ci
+
+      - name: Wait for Squid to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/3128) 2>/dev/null; then
+              exec 3<&- 3>&-
+              echo "Squid is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Squid did not become ready in time" >&2
+          docker logs squid || true
+          exit 1
+
       - name: Test
+        env:
+          WONDERWALL_TEST_SQUID_PROXY: http://127.0.0.1:3128
         run: poetry run pytest --cov --cov-report=xml
+
+      - name: Stop Squid sidecar
+        if: always()
+        run: docker rm -f squid || true
 
       - name: Upload coverage
         uses: actions/upload-artifact@v4

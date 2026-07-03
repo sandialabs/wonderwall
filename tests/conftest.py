@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 import socket
 import threading
@@ -154,3 +155,17 @@ def proxy_server(monkeypatch):
     loop.call_soon_threadsafe(loop.stop)
     thread.join(timeout=2.0)
     loop.close()
+
+
+@pytest.fixture()
+def real_squid_proxy():
+    """Yields the URL of a real Squid forward proxy for integration testing, skipping if unavailable.
+
+    Set via WONDERWALL_TEST_SQUID_PROXY (see .github/workflows/ci.yml), never HTTPS_PROXY --
+    the latter is read once at import time into proxy_config.PROXY_URL, so setting it globally
+    would silently route every other mock-based test through a real proxy for the whole session.
+    """
+    proxy_url = os.environ.get("WONDERWALL_TEST_SQUID_PROXY")
+    if not proxy_url:
+        pytest.skip("WONDERWALL_TEST_SQUID_PROXY not set; no real Squid proxy available for this test")
+    return proxy_url

@@ -2,6 +2,7 @@
 
 import asyncio
 import socket
+import ssl
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import wonderwall.https_proxy as proxy_module
@@ -337,6 +338,44 @@ class TestHandleTlsForwardProxy:
                 proxy_config.PROXY_URL = original_proxy_url
                 proxy_config.NO_PROXY = original_no_proxy
             mock_open.assert_called_once_with("bypassed.com", proxy_module.UPSTREAM_PORT)
+
+        asyncio.run(_test())
+
+
+# ─────────────────────────────────────────────
+# Integration: real Squid sidecar (CI only — see conftest.real_squid_proxy)
+# ─────────────────────────────────────────────
+
+
+class TestHandleTlsThroughRealSquid:
+    def test_relays_real_tls_traffic_through_squid_to_internet(self, real_squid_proxy, monkeypatch):
+        monkeypatch.setattr(proxy_config, "PROXY_URL", real_squid_proxy)
+        monkeypatch.setattr(proxy_config, "NO_PROXY", [])
+        monkeypatch.setattr(proxy_module, "ALLOWED_HOSTS", None)
+        monkeypatch.setattr(proxy_module, "STATIC_DOMAIN", "")
+
+        def blocking_request(port):
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+                with ctx.wrap_socket(sock, server_hostname="example.com") as tls_sock:
+                    tls_sock.sendall(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+                    tls_sock.settimeout(10)
+                    response = b""
+                    try:
+                        while chunk := tls_sock.recv(4096):
+                            response += chunk
+                    except socket.timeout:
+                        pass
+                    return response
+
+        async def _test():
+            server = await asyncio.start_server(handle_tls, "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            async with server:
+                response = await asyncio.get_event_loop().run_in_executor(None, blocking_request, port)
+            assert response.startswith(b"HTTP/1.1")
 
         asyncio.run(_test())
 
