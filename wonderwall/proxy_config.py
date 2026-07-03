@@ -1,6 +1,8 @@
 """Helpers for routing wonderwall's own outbound connections through a configured upstream forward proxy."""
 
+import asyncio
 import os
+import urllib.parse
 
 _PROXY_ENV_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
 _NO_PROXY_ENV_VARS = ("NO_PROXY", "no_proxy")
@@ -57,6 +59,72 @@ def _hostname_bypasses_proxy(hostname: str, no_proxy: list[str]) -> bool:
         entry == "*" or hostname == entry or hostname.endswith("." + entry)
         for entry in no_proxy
     )
+
+
+def _parse_proxy_host_port(proxy_url: str) -> tuple[str, int]:
+    """Parse a forward-proxy URL into (host, port) for a plain TCP connection to the proxy.
+
+    The URL's scheme is ignored: HTTPS_PROXY conventionally holds a plain http://
+    URL meaning "speak plain HTTP CONNECT to this proxy", not "speak TLS to the
+    proxy itself". TLS-to-proxy and proxy authentication (userinfo in the URL)
+    are both out of scope for now. Defaults to port 80 if unspecified.
+    """
+    parts = urllib.parse.urlsplit(proxy_url)
+    host = parts.hostname
+    if not host:
+        raise ConnectionError(f"invalid forward proxy URL: {proxy_url!r}")
+    return host, parts.port or 80
+
+
+async def _connect_via_proxy(
+    proxy_host: str, proxy_port: int, target_host: str, target_port: int
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Open a TCP connection to the proxy and CONNECT-tunnel it to (target_host, target_port).
+
+    Returns the proxy connection's own (reader, writer) pair once the tunnel is
+    established -- from that point on it behaves exactly like a direct connection
+    to the target for byte-relay purposes (no decryption happens here regardless).
+    Raises ConnectionError if the proxy connection fails, the response is
+    malformed/truncated, or the proxy does not respond 200 to the CONNECT.
+    """
+    reader, writer = await asyncio.open_connection(proxy_host, proxy_port)
+    target = f"{target_host}:{target_port}"
+    request = f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode("ascii")
+    writer.write(request)
+    await writer.drain()
+
+    try:
+        response = await reader.readuntil(b"\r\n\r\n")
+    except (ConnectionError, OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError) as e:
+        writer.close()
+        raise ConnectionError(
+            f"no valid response from proxy {proxy_host}:{proxy_port} for CONNECT {target}: {e}"
+        ) from e
+
+    status_line = response.split(b"\r\n", 1)[0]
+    status_parts = status_line.decode("latin-1", errors="replace").split(maxsplit=2)
+    if len(status_parts) < 2 or status_parts[1] != "200":
+        writer.close()
+        raise ConnectionError(
+            f"proxy {proxy_host}:{proxy_port} refused CONNECT {target}: {status_line!r}"
+        )
+
+    return reader, writer
+
+
+async def open_upstream_connection(hostname: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Open a connection to (hostname, port) for TLS pass-through, routing through
+    the configured forward proxy (PROXY_URL) via HTTP CONNECT unless hostname is
+    bypassed by NO_PROXY.
+
+    With no forward proxy configured (PROXY_URL is None, the default), this is
+    exactly asyncio.open_connection(hostname, port) -- byte-for-byte identical to
+    a direct connection, so existing direct-connect behavior is unaffected.
+    """
+    if PROXY_URL is None or _hostname_bypasses_proxy(hostname, NO_PROXY):
+        return await asyncio.open_connection(hostname, port)
+    proxy_host, proxy_port = _parse_proxy_host_port(PROXY_URL)
+    return await _connect_via_proxy(proxy_host, proxy_port, hostname, port)
 
 
 PROXY_URL = _get_proxy_url()  # None = no forward proxy configured

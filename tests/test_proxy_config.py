@@ -1,9 +1,18 @@
 """Tests for wonderwall forward-proxy env var helpers (wonderwall/proxy_config.py)."""
 
+import asyncio
 import importlib
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import wonderwall.proxy_config as proxy_config
-from wonderwall.proxy_config import _get_proxy_url, _hostname_bypasses_proxy, _parse_no_proxy
+from wonderwall.proxy_config import (
+    _connect_via_proxy,
+    _get_proxy_url,
+    _hostname_bypasses_proxy,
+    _parse_no_proxy,
+    _parse_proxy_host_port,
+    open_upstream_connection,
+)
 
 _ALL_PROXY_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
 _ALL_NO_PROXY_VARS = ("NO_PROXY", "no_proxy")
@@ -108,6 +117,184 @@ class TestHostnameBypassesProxy:
         no_proxy = ["foo.com", "bar.com"]
         assert _hostname_bypasses_proxy("bar.com", no_proxy) is True
         assert _hostname_bypasses_proxy("baz.com", no_proxy) is False
+
+
+# ─────────────────────────────────────────────
+# _parse_proxy_host_port
+# ─────────────────────────────────────────────
+
+
+class TestParseProxyHostPort:
+    def test_parses_host_and_port(self):
+        assert _parse_proxy_host_port("http://proxy:3128") == ("proxy", 3128)
+
+    def test_defaults_port_when_unspecified(self):
+        assert _parse_proxy_host_port("http://proxy") == ("proxy", 80)
+
+    def test_ignores_scheme(self):
+        assert _parse_proxy_host_port("https://proxy:3128") == ("proxy", 3128)
+
+    def test_raises_connection_error_when_no_host(self):
+        try:
+            _parse_proxy_host_port("proxy:3128")
+            assert False, "expected ConnectionError"
+        except ConnectionError:
+            pass
+
+
+# ─────────────────────────────────────────────
+# _connect_via_proxy
+# ─────────────────────────────────────────────
+
+
+def _fake_proxy_pair(response: bytes | None = None):
+    """Return a (reader, writer) pair simulating a proxy connection."""
+    reader = asyncio.StreamReader()
+    if response is not None:
+        reader.feed_data(response)
+    reader.feed_eof()
+    writer = MagicMock()
+    writer.write = MagicMock()
+    writer.drain = AsyncMock()
+    writer.close = MagicMock()
+    return reader, writer
+
+
+class TestConnectViaProxy:
+    def test_successful_connect_returns_reader_and_writer(self):
+        async def _test():
+            reader, writer = _fake_proxy_pair(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            with patch("asyncio.open_connection", AsyncMock(return_value=(reader, writer))):
+                result_r, result_w = await _connect_via_proxy("proxy", 3128, "example.com", 443)
+            assert result_r is reader
+            assert result_w is writer
+
+        asyncio.run(_test())
+
+    def test_writes_correct_connect_request_bytes(self):
+        async def _test():
+            reader, writer = _fake_proxy_pair(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            with patch("asyncio.open_connection", AsyncMock(return_value=(reader, writer))):
+                await _connect_via_proxy("proxy", 3128, "example.com", 443)
+            writer.write.assert_called_once_with(
+                b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+            )
+
+        asyncio.run(_test())
+
+    def test_connects_to_proxy_host_and_port_not_target(self):
+        async def _test():
+            reader, writer = _fake_proxy_pair(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            mock_open = AsyncMock(return_value=(reader, writer))
+            with patch("asyncio.open_connection", mock_open):
+                await _connect_via_proxy("proxy", 3128, "example.com", 443)
+            mock_open.assert_called_once_with("proxy", 3128)
+
+        asyncio.run(_test())
+
+    def test_non_200_response_raises_and_closes_writer(self):
+        async def _test():
+            reader, writer = _fake_proxy_pair(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            with patch("asyncio.open_connection", AsyncMock(return_value=(reader, writer))):
+                try:
+                    await _connect_via_proxy("proxy", 3128, "example.com", 443)
+                    assert False, "expected ConnectionError"
+                except ConnectionError:
+                    pass
+            writer.close.assert_called_once()
+
+        asyncio.run(_test())
+
+    def test_malformed_truncated_response_raises_connection_error(self):
+        async def _test():
+            reader, writer = _fake_proxy_pair(b"HTTP/1.1 200 ")  # no terminating \r\n\r\n, then EOF
+            with patch("asyncio.open_connection", AsyncMock(return_value=(reader, writer))):
+                try:
+                    await _connect_via_proxy("proxy", 3128, "example.com", 443)
+                    assert False, "expected ConnectionError"
+                except ConnectionError:
+                    pass
+
+        asyncio.run(_test())
+
+
+# ─────────────────────────────────────────────
+# open_upstream_connection
+# ─────────────────────────────────────────────
+
+
+class TestOpenUpstreamConnection:
+    def test_connects_directly_when_no_proxy_configured(self):
+        async def _test():
+            original_proxy_url = proxy_config.PROXY_URL
+            try:
+                proxy_config.PROXY_URL = None
+                mock_open = AsyncMock(side_effect=ConnectionRefusedError("no server in test"))
+                with patch("asyncio.open_connection", mock_open):
+                    try:
+                        await open_upstream_connection("example.com", 443)
+                    except ConnectionRefusedError:
+                        pass
+                mock_open.assert_called_once_with("example.com", 443)
+            finally:
+                proxy_config.PROXY_URL = original_proxy_url
+
+        asyncio.run(_test())
+
+    def test_connects_directly_when_hostname_bypassed(self):
+        async def _test():
+            original_proxy_url, original_no_proxy = proxy_config.PROXY_URL, proxy_config.NO_PROXY
+            try:
+                proxy_config.PROXY_URL = "http://proxy:3128"
+                proxy_config.NO_PROXY = ["example.com"]
+                mock_open = AsyncMock(side_effect=ConnectionRefusedError("no server in test"))
+                with patch("asyncio.open_connection", mock_open):
+                    try:
+                        await open_upstream_connection("example.com", 443)
+                    except ConnectionRefusedError:
+                        pass
+                mock_open.assert_called_once_with("example.com", 443)
+            finally:
+                proxy_config.PROXY_URL = original_proxy_url
+                proxy_config.NO_PROXY = original_no_proxy
+
+        asyncio.run(_test())
+
+    def test_routes_through_proxy_when_configured_and_not_bypassed(self):
+        async def _test():
+            original_proxy_url, original_no_proxy = proxy_config.PROXY_URL, proxy_config.NO_PROXY
+            try:
+                proxy_config.PROXY_URL = "http://proxy:3128"
+                proxy_config.NO_PROXY = []
+                reader, writer = _fake_proxy_pair(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                mock_open = AsyncMock(return_value=(reader, writer))
+                with patch("asyncio.open_connection", mock_open):
+                    await open_upstream_connection("example.com", 443)
+                mock_open.assert_called_once_with("proxy", 3128)
+            finally:
+                proxy_config.PROXY_URL = original_proxy_url
+                proxy_config.NO_PROXY = original_no_proxy
+
+        asyncio.run(_test())
+
+    def test_propagates_connect_error_when_proxy_refuses(self):
+        async def _test():
+            original_proxy_url, original_no_proxy = proxy_config.PROXY_URL, proxy_config.NO_PROXY
+            try:
+                proxy_config.PROXY_URL = "http://proxy:3128"
+                proxy_config.NO_PROXY = []
+                reader, writer = _fake_proxy_pair(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                with patch("asyncio.open_connection", AsyncMock(return_value=(reader, writer))):
+                    try:
+                        await open_upstream_connection("example.com", 443)
+                        assert False, "expected ConnectionError"
+                    except ConnectionError:
+                        pass
+            finally:
+                proxy_config.PROXY_URL = original_proxy_url
+                proxy_config.NO_PROXY = original_no_proxy
+
+        asyncio.run(_test())
 
 
 # ─────────────────────────────────────────────

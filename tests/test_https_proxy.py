@@ -5,6 +5,7 @@ import socket
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import wonderwall.https_proxy as proxy_module
+from wonderwall import proxy_config
 from wonderwall.https_proxy import _parse_allowed_hosts, _wildcard_to_regex, extract_sni, handle_tls, relay
 from tests.helpers import build_client_hello
 
@@ -259,6 +260,83 @@ class TestHandleTls:
                 proxy_module.ALLOWED_HOSTS = original_allowed
                 proxy_module.STATIC_DOMAIN = original_static
             writer.close.assert_called_once()
+
+        asyncio.run(_test())
+
+
+# ─────────────────────────────────────────────
+# handle_tls — forward proxy routing
+# ─────────────────────────────────────────────
+
+
+class TestHandleTlsForwardProxy:
+    def test_delegates_to_proxy_config_open_upstream_connection(self):
+        async def _test():
+            reader, writer = TestHandleTls._make_client(build_client_hello("example.com"))
+            mock_open = AsyncMock(side_effect=ConnectionRefusedError("no upstream in test"))
+            original_allowed, original_static = proxy_module.ALLOWED_HOSTS, proxy_module.STATIC_DOMAIN
+            try:
+                proxy_module.ALLOWED_HOSTS = None
+                proxy_module.STATIC_DOMAIN = ""
+                with patch("wonderwall.proxy_config.open_upstream_connection", mock_open):
+                    await handle_tls(reader, writer)
+            finally:
+                proxy_module.ALLOWED_HOSTS = original_allowed
+                proxy_module.STATIC_DOMAIN = original_static
+            mock_open.assert_called_once_with("example.com", proxy_module.UPSTREAM_PORT)
+
+        asyncio.run(_test())
+
+    def test_routes_through_proxy_end_to_end_when_proxy_url_set(self):
+        async def _test():
+            reader, writer = TestHandleTls._make_client(build_client_hello("example.com"))
+            proxy_reader = asyncio.StreamReader()
+            proxy_reader.feed_data(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            proxy_reader.feed_eof()
+            proxy_writer = MagicMock()
+            proxy_writer.write = MagicMock()
+            proxy_writer.drain = AsyncMock()
+            proxy_writer.close = MagicMock()
+            mock_open = AsyncMock(return_value=(proxy_reader, proxy_writer))
+
+            original_allowed, original_static = proxy_module.ALLOWED_HOSTS, proxy_module.STATIC_DOMAIN
+            original_proxy_url, original_no_proxy = proxy_config.PROXY_URL, proxy_config.NO_PROXY
+            try:
+                proxy_module.ALLOWED_HOSTS = None
+                proxy_module.STATIC_DOMAIN = ""
+                proxy_config.PROXY_URL = "http://fakeproxy:3128"
+                proxy_config.NO_PROXY = []
+                with patch("asyncio.open_connection", mock_open):
+                    await handle_tls(reader, writer)
+            finally:
+                proxy_module.ALLOWED_HOSTS = original_allowed
+                proxy_module.STATIC_DOMAIN = original_static
+                proxy_config.PROXY_URL = original_proxy_url
+                proxy_config.NO_PROXY = original_no_proxy
+            mock_open.assert_called_once_with("fakeproxy", 3128)
+
+        asyncio.run(_test())
+
+    def test_bypasses_proxy_for_no_proxy_hostname_end_to_end(self):
+        async def _test():
+            reader, writer = TestHandleTls._make_client(build_client_hello("bypassed.com"))
+            mock_open = AsyncMock(side_effect=ConnectionRefusedError("no upstream in test"))
+
+            original_allowed, original_static = proxy_module.ALLOWED_HOSTS, proxy_module.STATIC_DOMAIN
+            original_proxy_url, original_no_proxy = proxy_config.PROXY_URL, proxy_config.NO_PROXY
+            try:
+                proxy_module.ALLOWED_HOSTS = None
+                proxy_module.STATIC_DOMAIN = ""
+                proxy_config.PROXY_URL = "http://fakeproxy:3128"
+                proxy_config.NO_PROXY = ["bypassed.com"]
+                with patch("asyncio.open_connection", mock_open):
+                    await handle_tls(reader, writer)
+            finally:
+                proxy_module.ALLOWED_HOSTS = original_allowed
+                proxy_module.STATIC_DOMAIN = original_static
+                proxy_config.PROXY_URL = original_proxy_url
+                proxy_config.NO_PROXY = original_no_proxy
+            mock_open.assert_called_once_with("bypassed.com", proxy_module.UPSTREAM_PORT)
 
         asyncio.run(_test())
 

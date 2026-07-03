@@ -7,6 +7,8 @@ import re
 import socket
 import struct
 import uuid
+
+from wonderwall import proxy_config
 from wonderwall.transfer_stats import TransferStats
 
 log = logging.getLogger(__name__)
@@ -135,7 +137,7 @@ async def handle_tls(client_r: asyncio.StreamReader, client_w: asyncio.StreamWri
             return
 
         log.info("[%s] %s → %s", request_id, addr, hostname)
-        upstream_r, upstream_w = await asyncio.open_connection(hostname, UPSTREAM_PORT)
+        upstream_r, upstream_w = await proxy_config.open_upstream_connection(hostname, UPSTREAM_PORT)
 
         # Create transfer stats tracker
         transfer_stats = TransferStats(request_id, addr, hostname)
