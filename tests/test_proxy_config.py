@@ -3,7 +3,10 @@
 import asyncio
 import importlib
 import socket
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 import wonderwall.proxy_config as proxy_config
 from wonderwall.proxy_config import (
@@ -18,6 +21,14 @@ from wonderwall.proxy_config import (
 
 _ALL_PROXY_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
 _ALL_NO_PROXY_VARS = ("NO_PROXY", "no_proxy")
+
+
+@pytest.fixture(autouse=True)
+def _reset_auto_proxy_cache():
+    """Ensure AUTO_PROXY's DNS-unresolvable cache never leaks between tests, regardless of order."""
+    proxy_config._proxy_unresolvable_until = 0.0
+    yield
+    proxy_config._proxy_unresolvable_until = 0.0
 
 
 # ─────────────────────────────────────────────
@@ -401,6 +412,85 @@ class TestOpenUpstreamConnection:
 
         asyncio.run(_test())
 
+    def test_skips_proxy_when_recently_found_unresolvable(self):
+        async def _test():
+            original_proxy_url, original_no_proxy, original_auto_proxy = (
+                proxy_config.PROXY_URL,
+                proxy_config.NO_PROXY,
+                proxy_config.AUTO_PROXY,
+            )
+            try:
+                proxy_config.PROXY_URL = "http://proxy:3128"
+                proxy_config.NO_PROXY = []
+                proxy_config.AUTO_PROXY = True
+                proxy_config._proxy_unresolvable_until = time.monotonic() + 100
+
+                mock_open = AsyncMock(return_value=_fake_proxy_pair())
+                with patch("asyncio.open_connection", mock_open):
+                    await open_upstream_connection("example.com", 443)
+                mock_open.assert_called_once_with("example.com", 443)
+            finally:
+                proxy_config.PROXY_URL = original_proxy_url
+                proxy_config.NO_PROXY = original_no_proxy
+                proxy_config.AUTO_PROXY = original_auto_proxy
+
+        asyncio.run(_test())
+
+    def test_retries_proxy_after_recheck_window_elapses(self):
+        async def _test():
+            original_proxy_url, original_no_proxy, original_auto_proxy = (
+                proxy_config.PROXY_URL,
+                proxy_config.NO_PROXY,
+                proxy_config.AUTO_PROXY,
+            )
+            try:
+                proxy_config.PROXY_URL = "http://proxy:3128"
+                proxy_config.NO_PROXY = []
+                proxy_config.AUTO_PROXY = True
+                # _proxy_unresolvable_until is 0.0 via the autouse fixture, i.e. already expired.
+
+                reader, writer = _fake_proxy_pair(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                mock_open = AsyncMock(return_value=(reader, writer))
+                with patch("asyncio.open_connection", mock_open):
+                    await open_upstream_connection("example.com", 443)
+                mock_open.assert_called_once_with("proxy", 3128)
+            finally:
+                proxy_config.PROXY_URL = original_proxy_url
+                proxy_config.NO_PROXY = original_no_proxy
+                proxy_config.AUTO_PROXY = original_auto_proxy
+
+        asyncio.run(_test())
+
+    def test_gaierror_sets_recheck_window(self):
+        async def _test():
+            original_proxy_url, original_no_proxy, original_auto_proxy = (
+                proxy_config.PROXY_URL,
+                proxy_config.NO_PROXY,
+                proxy_config.AUTO_PROXY,
+            )
+            try:
+                proxy_config.PROXY_URL = "http://proxy:3128"
+                proxy_config.NO_PROXY = []
+                proxy_config.AUTO_PROXY = True
+
+                async def fake_open_connection(host, port):
+                    if host == "proxy":
+                        raise socket.gaierror("Name or service not known")
+                    return _fake_proxy_pair()
+
+                mock_open = AsyncMock(side_effect=fake_open_connection)
+                before = time.monotonic()
+                with patch("asyncio.open_connection", mock_open):
+                    await open_upstream_connection("example.com", 443)
+                expected = before + proxy_config.AUTO_PROXY_RECHECK_SECONDS
+                assert expected - 1 <= proxy_config._proxy_unresolvable_until <= expected + 1
+            finally:
+                proxy_config.PROXY_URL = original_proxy_url
+                proxy_config.NO_PROXY = original_no_proxy
+                proxy_config.AUTO_PROXY = original_auto_proxy
+
+        asyncio.run(_test())
+
 
 # ─────────────────────────────────────────────
 # PROXY_URL env var loading
@@ -471,3 +561,24 @@ class TestAutoProxyEnvVar:
         monkeypatch.delenv("AUTO_PROXY", raising=False)
         importlib.reload(proxy_config)
         assert proxy_config.AUTO_PROXY is False
+
+
+# ─────────────────────────────────────────────
+# AUTO_PROXY_RECHECK_SECONDS env var loading
+# ─────────────────────────────────────────────
+
+
+class TestAutoProxyRecheckSecondsEnvVar:
+    def test_module_loads_auto_proxy_recheck_seconds_from_env(self, monkeypatch):
+        monkeypatch.setenv("AUTO_PROXY_RECHECK_SECONDS", "45")
+        importlib.reload(proxy_config)
+        try:
+            assert proxy_config.AUTO_PROXY_RECHECK_SECONDS == 45
+        finally:
+            monkeypatch.delenv("AUTO_PROXY_RECHECK_SECONDS", raising=False)
+            importlib.reload(proxy_config)
+
+    def test_module_defaults_auto_proxy_recheck_seconds_to_30_when_unset(self, monkeypatch):
+        monkeypatch.delenv("AUTO_PROXY_RECHECK_SECONDS", raising=False)
+        importlib.reload(proxy_config)
+        assert proxy_config.AUTO_PROXY_RECHECK_SECONDS == 30

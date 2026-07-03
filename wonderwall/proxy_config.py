@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import socket
+import time
 import urllib.parse
 
 log = logging.getLogger(__name__)
@@ -135,17 +136,27 @@ async def open_upstream_connection(hostname: str, port: int) -> tuple[asyncio.St
     If AUTO_PROXY is enabled and the proxy host itself can't be resolved in DNS,
     falls back to a direct connection instead of raising. Other proxy failures
     (refused, non-200 CONNECT, etc.) still raise regardless of AUTO_PROXY.
+
+    While AUTO_PROXY is enabled and the proxy was recently found unresolvable,
+    skips retrying it for AUTO_PROXY_RECHECK_SECONDS and connects directly
+    instead -- avoids paying a failed DNS lookup on every connection while the
+    proxy stays down, and automatically resumes using it once the window elapses.
     """
+    global _proxy_unresolvable_until
     if PROXY_URL is None or _hostname_bypasses_proxy(hostname, NO_PROXY):
         return await asyncio.open_connection(hostname, port)
     proxy_host, proxy_port = _parse_proxy_host_port(PROXY_URL)
     if AUTO_PROXY:
+        if time.monotonic() < _proxy_unresolvable_until:
+            return await asyncio.open_connection(hostname, port)
         try:
             return await _connect_via_proxy(proxy_host, proxy_port, hostname, port)
         except socket.gaierror as e:
+            _proxy_unresolvable_until = time.monotonic() + AUTO_PROXY_RECHECK_SECONDS
             log.warning(
-                "AUTO_PROXY: proxy host %r could not be resolved (%s); falling back to a direct connection to %s",
-                proxy_host, e, hostname,
+                "AUTO_PROXY: proxy host %r could not be resolved (%s); falling back to a direct "
+                "connection to %s and skipping the proxy for %ss",
+                proxy_host, e, hostname, AUTO_PROXY_RECHECK_SECONDS,
             )
             return await asyncio.open_connection(hostname, port)
     return await _connect_via_proxy(proxy_host, proxy_port, hostname, port)
@@ -154,3 +165,5 @@ async def open_upstream_connection(hostname: str, port: int) -> tuple[asyncio.St
 PROXY_URL = _get_proxy_url()  # None = no forward proxy configured
 NO_PROXY = _parse_no_proxy(_first_nonempty_env(_NO_PROXY_ENV_VARS, os.environ))  # bypass hostnames/suffixes
 AUTO_PROXY = _env_flag("AUTO_PROXY")  # if True, fall back to a direct connection when the proxy host can't be resolved
+AUTO_PROXY_RECHECK_SECONDS = int(os.getenv("AUTO_PROXY_RECHECK_SECONDS", "30"))  # how long to skip a proxy found unresolvable
+_proxy_unresolvable_until = 0.0  # monotonic timestamp; while now < this, AUTO_PROXY skips the proxy entirely
