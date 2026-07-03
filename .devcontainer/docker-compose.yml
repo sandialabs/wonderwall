@@ -1,0 +1,43 @@
+# Devcontainer compose setup: the "app" service is the actual dev environment,
+# paired with a "squid" sidecar that acts as an intercepting (SSL-bump) HTTP(S)
+# proxy so outbound traffic during dev sessions can be observed. The proxy is
+# opt-in (via HTTP_PROXY/HTTPS_PROXY) rather than network-enforced.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        USERNAME: vscode
+        USER_UID: ${USER_UID:-1000}
+        USER_GID: ${USER_GID:-1000}
+    init: true
+    command: sleep infinity
+    depends_on:
+      - squid
+    volumes:
+      - ..:/workspaces/wonderwall:cached
+      - devcontainer-claude-config:/home/vscode/.claude
+      - devcontainer-bash-history:/home/vscode/.bash_history_dir
+      - squid-ca-public:/usr/local/share/ca-certificates/squid:ro
+    environment:
+      NO_PROXY: localhost,127.0.0.1
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
+
+  squid:
+    build:
+      context: ./squid
+    volumes:
+      - squid-ca-private:/etc/squid/ssl_cert
+      - squid-ca-public:/etc/squid/ca-public
+      - squid-var-lib:/var/lib/squid
+
+volumes:
+  devcontainer-claude-config:
+  devcontainer-bash-history:
+  squid-ca-private:
+  squid-ca-public:
+  squid-var-lib:
