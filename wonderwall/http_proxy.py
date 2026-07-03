@@ -1,6 +1,5 @@
 """Static file HTTP server."""
 
-import http.client
 import logging
 import os
 import socket
@@ -9,6 +8,7 @@ import uuid
 from functools import partial
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
+from wonderwall import proxy_config
 from wonderwall.https_proxy import _parse_allowed_hosts
 from wonderwall.transfer_stats import TransferStats
 
@@ -89,8 +89,8 @@ class HttpProxyHandler(SimpleHTTPRequestHandler):
             body = None
 
         try:
-            conn = http.client.HTTPConnection(hostname, port, timeout=30)
-            conn.request(method, self.path, body=body, headers=forward_headers)
+            conn, request_target = proxy_config.open_upstream_http_connection(hostname, port, self.path, timeout=30)
+            conn.request(method, request_target, body=body, headers=forward_headers)
             resp = conn.getresponse()
 
             self.send_response_only(resp.status)

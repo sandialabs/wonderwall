@@ -1,6 +1,7 @@
 """Helpers for routing wonderwall's own outbound connections through a configured upstream forward proxy."""
 
 import asyncio
+import http.client
 import logging
 import os
 import socket
@@ -124,6 +125,22 @@ async def _connect_via_proxy(
     return reader, writer
 
 
+def _proxy_cache_valid() -> bool:
+    """True if AUTO_PROXY is on and the proxy was recently found unresolvable."""
+    return AUTO_PROXY and time.monotonic() < _proxy_unresolvable_until
+
+
+def _record_proxy_unresolvable(proxy_host: str, target_hostname: str, error: Exception) -> None:
+    """Cache that proxy_host is currently unresolvable for AUTO_PROXY_RECHECK_SECONDS."""
+    global _proxy_unresolvable_until
+    _proxy_unresolvable_until = time.monotonic() + AUTO_PROXY_RECHECK_SECONDS
+    log.warning(
+        "AUTO_PROXY: proxy host %r could not be resolved (%s); falling back to a direct "
+        "connection to %s and skipping the proxy for %ss",
+        proxy_host, error, target_hostname, AUTO_PROXY_RECHECK_SECONDS,
+    )
+
+
 async def open_upstream_connection(hostname: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     """Open a connection to (hostname, port) for TLS pass-through, routing through
     the configured forward proxy (PROXY_URL) via HTTP CONNECT unless hostname is
@@ -142,24 +159,58 @@ async def open_upstream_connection(hostname: str, port: int) -> tuple[asyncio.St
     instead -- avoids paying a failed DNS lookup on every connection while the
     proxy stays down, and automatically resumes using it once the window elapses.
     """
-    global _proxy_unresolvable_until
     if PROXY_URL is None or _hostname_bypasses_proxy(hostname, NO_PROXY):
         return await asyncio.open_connection(hostname, port)
     proxy_host, proxy_port = _parse_proxy_host_port(PROXY_URL)
     if AUTO_PROXY:
-        if time.monotonic() < _proxy_unresolvable_until:
+        if _proxy_cache_valid():
             return await asyncio.open_connection(hostname, port)
         try:
             return await _connect_via_proxy(proxy_host, proxy_port, hostname, port)
         except socket.gaierror as e:
-            _proxy_unresolvable_until = time.monotonic() + AUTO_PROXY_RECHECK_SECONDS
-            log.warning(
-                "AUTO_PROXY: proxy host %r could not be resolved (%s); falling back to a direct "
-                "connection to %s and skipping the proxy for %ss",
-                proxy_host, e, hostname, AUTO_PROXY_RECHECK_SECONDS,
-            )
+            _record_proxy_unresolvable(proxy_host, hostname, e)
             return await asyncio.open_connection(hostname, port)
     return await _connect_via_proxy(proxy_host, proxy_port, hostname, port)
+
+
+def open_upstream_http_connection(
+    hostname: str, port: int, path: str, timeout: float = 30
+) -> tuple[http.client.HTTPConnection, str]:
+    """Open an http.client.HTTPConnection for forwarding a plain-HTTP request to
+    (hostname, port), routing through the configured forward proxy unless bypassed
+    by NO_PROXY.
+
+    Returns (connection, request_target). request_target is what the caller should
+    pass to HTTPConnection.request(): the original path when connecting directly,
+    or an absolute-URI (http://hostname[:port]/path) when routed through the proxy
+    -- a plain-HTTP forward proxy determines its destination from the request line
+    itself (RFC 7230 §5.3.2), unlike the CONNECT-tunnel approach open_upstream_connection
+    uses for TLS pass-through. There's no proxy-response validation step here (unlike
+    _connect_via_proxy's 200-check): if the proxy can't reach the origin it just
+    returns its own HTTP error response, which the caller relays to the client as-is.
+
+    If AUTO_PROXY is enabled, connects eagerly to check for socket.gaierror (proxy
+    host unresolvable) and falls back to a direct connection if so, caching that via
+    _record_proxy_unresolvable -- mirroring open_upstream_connection. Without
+    AUTO_PROXY, the returned connection is left unconnected (http.client connects
+    lazily on .request()); any connection failure surfaces to the caller's existing
+    error handling exactly as before this change.
+    """
+    if PROXY_URL is None or _hostname_bypasses_proxy(hostname, NO_PROXY):
+        return http.client.HTTPConnection(hostname, port, timeout=timeout), path
+    proxy_host, proxy_port = _parse_proxy_host_port(PROXY_URL)
+    proxied_target = f"http://{hostname}{'' if port == 80 else f':{port}'}{path}"
+    if AUTO_PROXY:
+        if _proxy_cache_valid():
+            return http.client.HTTPConnection(hostname, port, timeout=timeout), path
+        conn = http.client.HTTPConnection(proxy_host, proxy_port, timeout=timeout)
+        try:
+            conn.connect()
+        except socket.gaierror as e:
+            _record_proxy_unresolvable(proxy_host, hostname, e)
+            return http.client.HTTPConnection(hostname, port, timeout=timeout), path
+        return conn, proxied_target
+    return http.client.HTTPConnection(proxy_host, proxy_port, timeout=timeout), proxied_target
 
 
 PROXY_URL = _get_proxy_url()  # None = no forward proxy configured

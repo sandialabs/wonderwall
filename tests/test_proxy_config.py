@@ -16,7 +16,10 @@ from wonderwall.proxy_config import (
     _hostname_bypasses_proxy,
     _parse_no_proxy,
     _parse_proxy_host_port,
+    _proxy_cache_valid,
+    _record_proxy_unresolvable,
     open_upstream_connection,
+    open_upstream_http_connection,
 )
 
 _ALL_PROXY_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
@@ -490,6 +493,226 @@ class TestOpenUpstreamConnection:
                 proxy_config.AUTO_PROXY = original_auto_proxy
 
         asyncio.run(_test())
+
+
+# ─────────────────────────────────────────────
+# _proxy_cache_valid / _record_proxy_unresolvable
+# ─────────────────────────────────────────────
+
+
+class TestProxyCacheValid:
+    def test_false_when_auto_proxy_disabled_even_with_active_window(self):
+        original_auto_proxy = proxy_config.AUTO_PROXY
+        try:
+            proxy_config.AUTO_PROXY = False
+            proxy_config._proxy_unresolvable_until = time.monotonic() + 100
+            assert _proxy_cache_valid() is False
+        finally:
+            proxy_config.AUTO_PROXY = original_auto_proxy
+
+    def test_false_when_window_expired(self):
+        original_auto_proxy = proxy_config.AUTO_PROXY
+        try:
+            proxy_config.AUTO_PROXY = True
+            proxy_config._proxy_unresolvable_until = time.monotonic() - 1
+            assert _proxy_cache_valid() is False
+        finally:
+            proxy_config.AUTO_PROXY = original_auto_proxy
+
+    def test_true_when_auto_proxy_enabled_and_window_active(self):
+        original_auto_proxy = proxy_config.AUTO_PROXY
+        try:
+            proxy_config.AUTO_PROXY = True
+            proxy_config._proxy_unresolvable_until = time.monotonic() + 100
+            assert _proxy_cache_valid() is True
+        finally:
+            proxy_config.AUTO_PROXY = original_auto_proxy
+
+
+class TestRecordProxyUnresolvable:
+    def test_sets_recheck_window(self):
+        before = time.monotonic()
+        _record_proxy_unresolvable("proxy", "example.com", socket.gaierror("Name or service not known"))
+        expected = before + proxy_config.AUTO_PROXY_RECHECK_SECONDS
+        assert expected - 1 <= proxy_config._proxy_unresolvable_until <= expected + 1
+
+
+# ─────────────────────────────────────────────
+# open_upstream_http_connection
+# ─────────────────────────────────────────────
+
+
+class TestOpenUpstreamHttpConnection:
+    def test_connects_directly_when_no_proxy_configured(self):
+        original_proxy_url = proxy_config.PROXY_URL
+        try:
+            proxy_config.PROXY_URL = None
+            mock_cls = MagicMock()
+            with patch("http.client.HTTPConnection", mock_cls):
+                conn, target = open_upstream_http_connection("example.com", 80, "/foo")
+            mock_cls.assert_called_once_with("example.com", 80, timeout=30)
+            assert target == "/foo"
+            conn.connect.assert_not_called()
+        finally:
+            proxy_config.PROXY_URL = original_proxy_url
+
+    def test_connects_directly_when_hostname_bypassed(self):
+        original_proxy_url, original_no_proxy = proxy_config.PROXY_URL, proxy_config.NO_PROXY
+        try:
+            proxy_config.PROXY_URL = "http://proxy:3128"
+            proxy_config.NO_PROXY = ["example.com"]
+            mock_cls = MagicMock()
+            with patch("http.client.HTTPConnection", mock_cls):
+                conn, target = open_upstream_http_connection("example.com", 80, "/foo")
+            mock_cls.assert_called_once_with("example.com", 80, timeout=30)
+            assert target == "/foo"
+            conn.connect.assert_not_called()
+        finally:
+            proxy_config.PROXY_URL = original_proxy_url
+            proxy_config.NO_PROXY = original_no_proxy
+
+    def test_proxied_absolute_uri_default_port(self):
+        original_proxy_url, original_no_proxy, original_auto_proxy = (
+            proxy_config.PROXY_URL,
+            proxy_config.NO_PROXY,
+            proxy_config.AUTO_PROXY,
+        )
+        try:
+            proxy_config.PROXY_URL = "http://proxy:3128"
+            proxy_config.NO_PROXY = []
+            proxy_config.AUTO_PROXY = False
+            mock_cls = MagicMock()
+            with patch("http.client.HTTPConnection", mock_cls):
+                conn, target = open_upstream_http_connection("example.com", 80, "/foo")
+            mock_cls.assert_called_once_with("proxy", 3128, timeout=30)
+            assert target == "http://example.com/foo"
+            conn.connect.assert_not_called()
+        finally:
+            proxy_config.PROXY_URL = original_proxy_url
+            proxy_config.NO_PROXY = original_no_proxy
+            proxy_config.AUTO_PROXY = original_auto_proxy
+
+    def test_proxied_absolute_uri_nondefault_port(self):
+        original_proxy_url, original_no_proxy, original_auto_proxy = (
+            proxy_config.PROXY_URL,
+            proxy_config.NO_PROXY,
+            proxy_config.AUTO_PROXY,
+        )
+        try:
+            proxy_config.PROXY_URL = "http://proxy:3128"
+            proxy_config.NO_PROXY = []
+            proxy_config.AUTO_PROXY = False
+            mock_cls = MagicMock()
+            with patch("http.client.HTTPConnection", mock_cls):
+                conn, target = open_upstream_http_connection("example.com", 8080, "/foo")
+            mock_cls.assert_called_once_with("proxy", 3128, timeout=30)
+            assert target == "http://example.com:8080/foo"
+            conn.connect.assert_not_called()
+        finally:
+            proxy_config.PROXY_URL = original_proxy_url
+            proxy_config.NO_PROXY = original_no_proxy
+            proxy_config.AUTO_PROXY = original_auto_proxy
+
+    def test_auto_proxy_skips_proxy_when_recently_unresolvable(self):
+        original_proxy_url, original_no_proxy, original_auto_proxy = (
+            proxy_config.PROXY_URL,
+            proxy_config.NO_PROXY,
+            proxy_config.AUTO_PROXY,
+        )
+        try:
+            proxy_config.PROXY_URL = "http://proxy:3128"
+            proxy_config.NO_PROXY = []
+            proxy_config.AUTO_PROXY = True
+            proxy_config._proxy_unresolvable_until = time.monotonic() + 100
+            mock_cls = MagicMock()
+            with patch("http.client.HTTPConnection", mock_cls):
+                conn, target = open_upstream_http_connection("example.com", 80, "/foo")
+            mock_cls.assert_called_once_with("example.com", 80, timeout=30)
+            assert target == "/foo"
+        finally:
+            proxy_config.PROXY_URL = original_proxy_url
+            proxy_config.NO_PROXY = original_no_proxy
+            proxy_config.AUTO_PROXY = original_auto_proxy
+
+    def test_auto_proxy_success_connects_eagerly_and_returns_proxy_uri(self):
+        original_proxy_url, original_no_proxy, original_auto_proxy = (
+            proxy_config.PROXY_URL,
+            proxy_config.NO_PROXY,
+            proxy_config.AUTO_PROXY,
+        )
+        try:
+            proxy_config.PROXY_URL = "http://proxy:3128"
+            proxy_config.NO_PROXY = []
+            proxy_config.AUTO_PROXY = True
+            # _proxy_unresolvable_until is 0.0 via the autouse fixture, i.e. already expired.
+            mock_cls = MagicMock()
+            with patch("http.client.HTTPConnection", mock_cls):
+                conn, target = open_upstream_http_connection("example.com", 80, "/foo")
+            mock_cls.assert_called_once_with("proxy", 3128, timeout=30)
+            conn.connect.assert_called_once()
+            assert target == "http://example.com/foo"
+        finally:
+            proxy_config.PROXY_URL = original_proxy_url
+            proxy_config.NO_PROXY = original_no_proxy
+            proxy_config.AUTO_PROXY = original_auto_proxy
+
+    def test_auto_proxy_gaierror_falls_back_and_caches(self):
+        original_proxy_url, original_no_proxy, original_auto_proxy = (
+            proxy_config.PROXY_URL,
+            proxy_config.NO_PROXY,
+            proxy_config.AUTO_PROXY,
+        )
+        try:
+            proxy_config.PROXY_URL = "http://proxy:3128"
+            proxy_config.NO_PROXY = []
+            proxy_config.AUTO_PROXY = True
+
+            def fake_http_connection(host, port, timeout=30):
+                conn = MagicMock()
+                if host == "proxy":
+                    conn.connect.side_effect = socket.gaierror("Name or service not known")
+                return conn
+
+            mock_cls = MagicMock(side_effect=fake_http_connection)
+            before = time.monotonic()
+            with patch("http.client.HTTPConnection", mock_cls):
+                conn, target = open_upstream_http_connection("example.com", 80, "/foo")
+            assert target == "/foo"
+            mock_cls.assert_called_with("example.com", 80, timeout=30)
+            expected = before + proxy_config.AUTO_PROXY_RECHECK_SECONDS
+            assert expected - 1 <= proxy_config._proxy_unresolvable_until <= expected + 1
+        finally:
+            proxy_config.PROXY_URL = original_proxy_url
+            proxy_config.NO_PROXY = original_no_proxy
+            proxy_config.AUTO_PROXY = original_auto_proxy
+
+    def test_does_not_fall_back_for_non_gaierror_when_auto_proxy_enabled(self):
+        original_proxy_url, original_no_proxy, original_auto_proxy = (
+            proxy_config.PROXY_URL,
+            proxy_config.NO_PROXY,
+            proxy_config.AUTO_PROXY,
+        )
+        try:
+            proxy_config.PROXY_URL = "http://proxy:3128"
+            proxy_config.NO_PROXY = []
+            proxy_config.AUTO_PROXY = True
+
+            def fake_http_connection(host, port, timeout=30):
+                conn = MagicMock()
+                conn.connect.side_effect = ConnectionRefusedError("no proxy in test")
+                return conn
+
+            mock_cls = MagicMock(side_effect=fake_http_connection)
+            with patch("http.client.HTTPConnection", mock_cls):
+                try:
+                    open_upstream_http_connection("example.com", 80, "/foo")
+                    assert False, "expected ConnectionRefusedError"
+                except ConnectionRefusedError:
+                    pass
+        finally:
+            proxy_config.PROXY_URL = original_proxy_url
+            proxy_config.NO_PROXY = original_no_proxy
+            proxy_config.AUTO_PROXY = original_auto_proxy
 
 
 # ─────────────────────────────────────────────
