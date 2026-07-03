@@ -1,11 +1,16 @@
 """Helpers for routing wonderwall's own outbound connections through a configured upstream forward proxy."""
 
 import asyncio
+import logging
 import os
+import socket
 import urllib.parse
+
+log = logging.getLogger(__name__)
 
 _PROXY_ENV_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
 _NO_PROXY_ENV_VARS = ("NO_PROXY", "no_proxy")
+_TRUTHY_VALUES = {"1", "true", "yes", "on"}
 
 
 def _first_nonempty_env(names: tuple[str, ...], env: dict[str, str]) -> str | None:
@@ -15,6 +20,12 @@ def _first_nonempty_env(names: tuple[str, ...], env: dict[str, str]) -> str | No
         if value:
             return value
     return None
+
+
+def _env_flag(name: str, env: dict[str, str] | None = None) -> bool:
+    """Return True if the named env var is set to a recognized truthy value (case-insensitive)."""
+    value = (os.environ if env is None else env).get(name, "")
+    return value.strip().lower() in _TRUTHY_VALUES
 
 
 def _get_proxy_url(env: dict[str, str] | None = None) -> str | None:
@@ -120,12 +131,26 @@ async def open_upstream_connection(hostname: str, port: int) -> tuple[asyncio.St
     With no forward proxy configured (PROXY_URL is None, the default), this is
     exactly asyncio.open_connection(hostname, port) -- byte-for-byte identical to
     a direct connection, so existing direct-connect behavior is unaffected.
+
+    If AUTO_PROXY is enabled and the proxy host itself can't be resolved in DNS,
+    falls back to a direct connection instead of raising. Other proxy failures
+    (refused, non-200 CONNECT, etc.) still raise regardless of AUTO_PROXY.
     """
     if PROXY_URL is None or _hostname_bypasses_proxy(hostname, NO_PROXY):
         return await asyncio.open_connection(hostname, port)
     proxy_host, proxy_port = _parse_proxy_host_port(PROXY_URL)
+    if AUTO_PROXY:
+        try:
+            return await _connect_via_proxy(proxy_host, proxy_port, hostname, port)
+        except socket.gaierror as e:
+            log.warning(
+                "AUTO_PROXY: proxy host %r could not be resolved (%s); falling back to a direct connection to %s",
+                proxy_host, e, hostname,
+            )
+            return await asyncio.open_connection(hostname, port)
     return await _connect_via_proxy(proxy_host, proxy_port, hostname, port)
 
 
 PROXY_URL = _get_proxy_url()  # None = no forward proxy configured
 NO_PROXY = _parse_no_proxy(_first_nonempty_env(_NO_PROXY_ENV_VARS, os.environ))  # bypass hostnames/suffixes
+AUTO_PROXY = _env_flag("AUTO_PROXY")  # if True, fall back to a direct connection when the proxy host can't be resolved

@@ -2,11 +2,13 @@
 
 import asyncio
 import importlib
+import socket
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import wonderwall.proxy_config as proxy_config
 from wonderwall.proxy_config import (
     _connect_via_proxy,
+    _env_flag,
     _get_proxy_url,
     _hostname_bypasses_proxy,
     _parse_no_proxy,
@@ -50,6 +52,31 @@ class TestGetProxyUrl:
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setenv("HTTPS_PROXY", "http://from-environ:3128")
         assert _get_proxy_url() == "http://from-environ:3128"
+
+
+# ─────────────────────────────────────────────
+# _env_flag
+# ─────────────────────────────────────────────
+
+
+class TestEnvFlag:
+    def test_returns_false_for_empty_env(self):
+        assert _env_flag("AUTO_PROXY", {}) is False
+
+    def test_recognizes_truthy_values_case_insensitively(self):
+        for value in ("1", "true", "True", "TRUE", "yes", "Yes", "on", "ON"):
+            assert _env_flag("AUTO_PROXY", {"AUTO_PROXY": value}) is True
+
+    def test_returns_false_for_other_values(self):
+        for value in ("0", "false", "no", "off", "nope", ""):
+            assert _env_flag("AUTO_PROXY", {"AUTO_PROXY": value}) is False
+
+    def test_strips_whitespace(self):
+        assert _env_flag("AUTO_PROXY", {"AUTO_PROXY": "  true  "}) is True
+
+    def test_defaults_to_os_environ(self, monkeypatch):
+        monkeypatch.setenv("AUTO_PROXY", "true")
+        assert _env_flag("AUTO_PROXY") is True
 
 
 # ─────────────────────────────────────────────
@@ -296,6 +323,84 @@ class TestOpenUpstreamConnection:
 
         asyncio.run(_test())
 
+    def test_falls_back_to_direct_when_auto_proxy_enabled_and_proxy_unresolvable(self):
+        async def _test():
+            original_proxy_url, original_no_proxy, original_auto_proxy = (
+                proxy_config.PROXY_URL,
+                proxy_config.NO_PROXY,
+                proxy_config.AUTO_PROXY,
+            )
+            try:
+                proxy_config.PROXY_URL = "http://proxy:3128"
+                proxy_config.NO_PROXY = []
+                proxy_config.AUTO_PROXY = True
+
+                async def fake_open_connection(host, port):
+                    if host == "proxy":
+                        raise socket.gaierror("Name or service not known")
+                    return _fake_proxy_pair()
+
+                mock_open = AsyncMock(side_effect=fake_open_connection)
+                with patch("asyncio.open_connection", mock_open):
+                    await open_upstream_connection("example.com", 443)
+                mock_open.assert_called_with("example.com", 443)
+            finally:
+                proxy_config.PROXY_URL = original_proxy_url
+                proxy_config.NO_PROXY = original_no_proxy
+                proxy_config.AUTO_PROXY = original_auto_proxy
+
+        asyncio.run(_test())
+
+    def test_does_not_fall_back_when_auto_proxy_disabled(self):
+        async def _test():
+            original_proxy_url, original_no_proxy, original_auto_proxy = (
+                proxy_config.PROXY_URL,
+                proxy_config.NO_PROXY,
+                proxy_config.AUTO_PROXY,
+            )
+            try:
+                proxy_config.PROXY_URL = "http://proxy:3128"
+                proxy_config.NO_PROXY = []
+                proxy_config.AUTO_PROXY = False
+                mock_open = AsyncMock(side_effect=socket.gaierror("Name or service not known"))
+                with patch("asyncio.open_connection", mock_open):
+                    try:
+                        await open_upstream_connection("example.com", 443)
+                        assert False, "expected socket.gaierror"
+                    except socket.gaierror:
+                        pass
+            finally:
+                proxy_config.PROXY_URL = original_proxy_url
+                proxy_config.NO_PROXY = original_no_proxy
+                proxy_config.AUTO_PROXY = original_auto_proxy
+
+        asyncio.run(_test())
+
+    def test_does_not_fall_back_for_non_dns_errors_when_auto_proxy_enabled(self):
+        async def _test():
+            original_proxy_url, original_no_proxy, original_auto_proxy = (
+                proxy_config.PROXY_URL,
+                proxy_config.NO_PROXY,
+                proxy_config.AUTO_PROXY,
+            )
+            try:
+                proxy_config.PROXY_URL = "http://proxy:3128"
+                proxy_config.NO_PROXY = []
+                proxy_config.AUTO_PROXY = True
+                mock_open = AsyncMock(side_effect=ConnectionRefusedError("no server in test"))
+                with patch("asyncio.open_connection", mock_open):
+                    try:
+                        await open_upstream_connection("example.com", 443)
+                        assert False, "expected ConnectionRefusedError"
+                    except ConnectionRefusedError:
+                        pass
+            finally:
+                proxy_config.PROXY_URL = original_proxy_url
+                proxy_config.NO_PROXY = original_no_proxy
+                proxy_config.AUTO_PROXY = original_auto_proxy
+
+        asyncio.run(_test())
+
 
 # ─────────────────────────────────────────────
 # PROXY_URL env var loading
@@ -345,3 +450,24 @@ class TestNoProxyEnvVar:
             monkeypatch.delenv(var, raising=False)
         importlib.reload(proxy_config)
         assert proxy_config.NO_PROXY == []
+
+
+# ─────────────────────────────────────────────
+# AUTO_PROXY env var loading
+# ─────────────────────────────────────────────
+
+
+class TestAutoProxyEnvVar:
+    def test_module_loads_auto_proxy_from_env(self, monkeypatch):
+        monkeypatch.setenv("AUTO_PROXY", "true")
+        importlib.reload(proxy_config)
+        try:
+            assert proxy_config.AUTO_PROXY is True
+        finally:
+            monkeypatch.delenv("AUTO_PROXY", raising=False)
+            importlib.reload(proxy_config)
+
+    def test_module_defaults_auto_proxy_to_false_when_unset(self, monkeypatch):
+        monkeypatch.delenv("AUTO_PROXY", raising=False)
+        importlib.reload(proxy_config)
+        assert proxy_config.AUTO_PROXY is False
