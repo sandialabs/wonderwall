@@ -41,15 +41,20 @@ jobs:
 
       - name: Wait for Squid to be ready
         run: |
+          # A bare TCP connect only proves docker's port mapping is accepting
+          # connections -- it can succeed via docker-proxy before Squid itself
+          # has finished entrypoint.sh's CA/ssl_db setup and actually bound the
+          # port. Proxy a real request through Squid instead, so readiness means
+          # "Squid can actually forward traffic," which is what the tests need.
           for i in $(seq 1 30); do
-            if (exec 3<>/dev/tcp/127.0.0.1/3128) 2>/dev/null; then
-              exec 3<&- 3>&-
-              echo "Squid is up"
+            if curl --fail --silent --max-time 2 --proxy http://127.0.0.1:3128 http://example.com/ -o /dev/null; then
+              echo "Squid is up and proxying"
               exit 0
             fi
             sleep 1
           done
           echo "Squid did not become ready in time" >&2
+          curl --verbose --max-time 5 --proxy http://127.0.0.1:3128 http://example.com/ -o /dev/null || true
           docker logs squid || true
           exit 1
 
@@ -57,6 +62,10 @@ jobs:
         env:
           WONDERWALL_TEST_SQUID_PROXY: http://127.0.0.1:3128
         run: poetry run pytest --cov --cov-report=xml
+
+      - name: Capture Squid logs
+        if: always()
+        run: docker logs squid > squid.log 2>&1 || true
 
       - name: Stop Squid sidecar
         if: always()
@@ -68,6 +77,14 @@ jobs:
         with:
           name: coverage-report
           path: coverage.xml
+          retention-days: 7
+
+      - name: Upload Squid logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: squid-logs
+          path: squid.log
           retention-days: 7
 
   publish:
