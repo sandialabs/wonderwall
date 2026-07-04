@@ -11,7 +11,7 @@ LOG_DIR=/var/log/squid
 ACCESS_LOG="$LOG_DIR/access.log"
 CACHE_LOG="$LOG_DIR/cache.log"
 
-mkdir -p "$CA_DIR" "$PUBLIC_DIR" "$LOG_DIR"
+mkdir -p "$CA_DIR" "$PUBLIC_DIR" "$LOG_DIR" "$(dirname "$SSL_DB")"
 
 # Generate the interception CA once; persisted in a volume so rebuilding this
 # image doesn't rotate the CA and break trust already established elsewhere.
