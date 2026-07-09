@@ -8,6 +8,7 @@ import pytest
 import requests
 
 import wonderwall.http_proxy as static_module
+from wonderwall import proxy_config
 from wonderwall.http_proxy import HttpProxyHandler
 
 
@@ -26,6 +27,30 @@ class TestHttpProxyHandler:
             HttpProxyHandler.log_message(handler, "%s %s", "GET", "/index.html")
 
         mock_log.info.assert_called_once_with("[%s] HTTP %s %s", 'reqid', "1.2.3.4", "GET /index.html")
+
+    def test_proxy_request_delegates_to_proxy_config_open_upstream_http_connection(self):
+        handler = MagicMock(spec=HttpProxyHandler)
+        handler.request_id = "reqid"
+        handler.client_address = ("1.2.3.4", 5678)
+        handler.path = "/proxied.txt"
+        handler.headers = {"Host": "example.com:8080"}
+        handler.wfile = MagicMock()
+
+        fake_conn = MagicMock()
+        fake_conn.getresponse.return_value = MagicMock(
+            status=200,
+            getheaders=MagicMock(return_value=[("Content-Length", "5")]),
+            read=MagicMock(side_effect=[b"hello", b""]),
+        )
+        mock_open = MagicMock(return_value=(fake_conn, "http://example.com:8080/proxied.txt"))
+        with patch.object(static_module, "proxy_config") as mock_proxy_config:
+            mock_proxy_config.open_upstream_http_connection = mock_open
+            HttpProxyHandler._proxy_request(handler, "GET")
+
+        mock_open.assert_called_once_with("example.com", 8080, "/proxied.txt", timeout=30)
+        fake_conn.request.assert_called_once_with(
+            "GET", "http://example.com:8080/proxied.txt", body=None, headers={"Host": "example.com:8080"}
+        )
 
 
 # ─────────────────────────────────────────────
@@ -279,6 +304,24 @@ class TestAllowedHosts:
         r = requests.get(
             f"{static_server.base_url}/wc.txt",
             headers={"Host": f"127.0.0.1:{upstream_server.port}"},
+            allow_redirects=False,
+        )
+        assert r.status_code == 200
+
+
+# ─────────────────────────────────────────────
+# Integration: real Squid sidecar (CI only — see conftest.real_squid_proxy)
+# ─────────────────────────────────────────────
+
+
+class TestProxyThroughRealSquid:
+    def test_proxies_real_http_traffic_through_squid_to_internet(self, real_squid_proxy, static_server, monkeypatch):
+        monkeypatch.setattr(proxy_config, "PROXY_URL", real_squid_proxy)
+        monkeypatch.setattr(proxy_config, "NO_PROXY", [])
+
+        r = requests.get(
+            f"{static_server.base_url}/",
+            headers={"Host": "example.com"},
             allow_redirects=False,
         )
         assert r.status_code == 200

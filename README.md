@@ -39,6 +39,11 @@ All configuration is via environment variables.
 | `ALLOWED_HOSTS` | *(allow all)* | Comma-separated wildcard patterns; only matching hostnames are proxied (applies to both HTTP and TLS). `*.example.com` matches subdomains at any depth; `pre*.example.com` matches within a single label only. |
 | `UPSTREAM_PORT` | `443` | Port used when connecting to upstream TLS servers |
 | `LOG_LEVEL` | `INFO` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
+| `LOG_FILE` | *(unset)* | If set, log output is also written to this file in addition to stdout |
+| `HTTPS_PROXY` / `https_proxy` / `HTTP_PROXY` / `http_proxy` | *(unset)* | Upstream forward proxy URL for wonderwall's own outbound connections. Checked in that order (uppercase before lowercase, https before http); the first non-empty value wins |
+| `NO_PROXY` / `no_proxy` | *(unset)* | Comma-separated hostnames/domain suffixes (or `*` for all) to bypass the forward proxy for |
+| `AUTO_PROXY` | `false` | If enabled, falls back to a direct connection when the forward proxy host can't be resolved, instead of failing |
+| `AUTO_PROXY_RECHECK_SECONDS` | `30` | While `AUTO_PROXY` is enabled, how long to skip a proxy that was just found unresolvable before retrying it |
 
 ## Running with Docker
 
