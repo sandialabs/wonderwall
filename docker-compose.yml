@@ -18,6 +18,11 @@ services:
       DNS_A_RECORD_IP: ${WONDERWALL_IP:-172.128.0.128}
       INTERNAL_SUBNET: ${INTERNAL_SUBNET:-172.128.0.0/24}
       ALLOWED_HOSTS: "*.google.com,google.com,*.httpbin.org,httpbin.org"
+      # FORWARD_PORTS: "5432,16379:6379"  # forward to services on the Docker host
+    extra_hosts:
+      # Required on Linux Docker Engine for FORWARD_PORTS' default target
+      # (host.docker.internal) to resolve; Docker Desktop provides it already.
+      - "host.docker.internal:host-gateway"
     networks:
       default: {}
       internal:

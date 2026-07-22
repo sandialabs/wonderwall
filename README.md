@@ -24,6 +24,10 @@ If `INTERNAL_SUBNET` is set, the server first attempts to resolve the queried ho
 
 Forwards HTTP requests to the upstream host named in the `Host` header. If `STATIC_DOMAIN` is set, requests for that domain are served from `STATIC_DIR` instead of being proxied; that domain is also excluded from TLS proxying. If `STATIC_DOMAIN` is not set, all requests are proxied. Proxied domains can be restricted to an allowlist via `ALLOWED_HOSTS`.
 
+### Port Forwarding
+
+If `FORWARD_PORTS` is set, wonderwall listens on each configured port and relays raw TCP traffic to `FORWARD_TARGET_HOST` (`host.docker.internal` by default) — no protocol awareness, so this works for Postgres, Redis, or any other TCP service running on the Docker host. This lets a sandboxed container reach host-side services even though it can otherwise only see wonderwall's DNS/HTTP/HTTPS ports. Each comma-separated entry is either `PORT` (forwards `PORT` to the same port on the target) or `LISTEN_PORT:TARGET_PORT` (forwards `LISTEN_PORT` to a different `TARGET_PORT` on the target). Listen ports must not collide with the DNS, HTTP, or SNI proxy ports.
+
 ## Configuration
 
 All configuration is via environment variables.
@@ -38,6 +42,8 @@ All configuration is via environment variables.
 | `STATIC_DOMAIN` | *(system hostname)* | Requests for this domain are served as static files; all other HTTP requests are proxied. If unset, all HTTP traffic is proxied. Also excluded from TLS proxying. |
 | `ALLOWED_HOSTS` | *(allow all)* | Comma-separated wildcard patterns; only matching hostnames are proxied (applies to both HTTP and TLS). `*.example.com` matches subdomains at any depth; `pre*.example.com` matches within a single label only. |
 | `UPSTREAM_PORT` | `443` | Port used when connecting to upstream TLS servers |
+| `FORWARD_PORTS` | *(unset)* | Comma-separated TCP ports to forward to `FORWARD_TARGET_HOST`. Each entry is `PORT` (forwards `PORT` to `PORT`) or `LISTEN_PORT:TARGET_PORT`. Listen ports must not collide with `DNS_PORT`, `HTTP_PORT`, or the SNI proxy port (443) |
+| `FORWARD_TARGET_HOST` | `host.docker.internal` | Host that forwarded ports connect to |
 | `LOG_LEVEL` | `INFO` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 | `LOG_FILE` | *(unset)* | If set, log output is also written to this file in addition to stdout |
 | `HTTPS_PROXY` / `https_proxy` / `HTTP_PROXY` / `http_proxy` | *(unset)* | Upstream forward proxy URL for wonderwall's own outbound connections. Checked in that order (uppercase before lowercase, https before http); the first non-empty value wins |
@@ -67,6 +73,8 @@ docker run \
   -p 443:443 \
   ghcr.io/sandialabs/wonderwall:0.2
 ```
+
+To use `FORWARD_PORTS` on Linux (Docker Engine), also pass `--add-host=host.docker.internal:host-gateway` so `host.docker.internal` resolves to the host machine — Docker Desktop on Mac/Windows provides this DNS name automatically.
 
 Static files can be mounted into the container:
 
